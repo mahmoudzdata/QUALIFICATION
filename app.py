@@ -1,8 +1,11 @@
 """
 Keyword & Part Scanner — Ultra-Lite v5 (Streamlit Edition)
 ===========================================================
-Streamlit port of the tkinter GUI scanner.
-Run with:  streamlit run app.py
+Fixes applied:
+  1. Results download button now renders correctly (was using .columns() on st.empty())
+  2. Sidebar text colours fixed — labels readable, values contrasted
+  3. Stop / Pause / Resume buttons added with threading Events
+  4. Auto-save on error / connection cut — partial results written to session_state immediately
 """
 
 import re
@@ -301,9 +304,22 @@ def _search_part(raw: str, part) -> str:
 
 
 def _process_row(row_index, url, part, keywords, mil_keywords, timeout,
-                 rate_limiter, circuit_breaker, session) -> dict:
+                 rate_limiter, circuit_breaker, session,
+                 stop_event=None, pause_event=None) -> dict:
+    """Scan one row. Respects stop/pause threading events."""
     url_str  = _safe_str(url)
     part_str = _safe_str(part)
+
+    # ── Pause support ──────────────────────────────────────────────
+    if pause_event:
+        while pause_event.is_set():
+            if stop_event and stop_event.is_set():
+                raise InterruptedError("Stopped by user")
+            time.sleep(0.5)
+
+    # ── Stop support ───────────────────────────────────────────────
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Stopped by user")
 
     if circuit_breaker:
         circuit_breaker.wait_if_tripped()
@@ -325,6 +341,8 @@ def _process_row(row_index, url, part, keywords, mil_keywords, timeout,
 
         if circuit_breaker:
             circuit_breaker.record_success()
+    except InterruptedError:
+        raise
     except Exception as e:
         if circuit_breaker:
             circuit_breaker.record_error()
@@ -431,8 +449,21 @@ def _highlight_excel(df: pd.DataFrame) -> bytes:
     return out.getvalue()
 
 
+def _build_partial_excel(df_work, all_results, keywords,
+                          orig_qual, orig_ztemp, orig_feature, ref_map) -> bytes:
+    """Build an Excel file from whatever results we have so far (partial save)."""
+    try:
+        df_partial = _apply_results_to_df(
+            df_work.copy(), all_results, keywords,
+            orig_qual, orig_ztemp, orig_feature, ref_map
+        )
+        return _highlight_excel(df_partial)
+    except Exception:
+        return b""
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
+#  STREAMLIT PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
@@ -448,14 +479,54 @@ st.markdown("""
 
 html, body, [class*="css"] { font-family: 'Sora', sans-serif; }
 
-/* Sidebar */
+/* ── Sidebar base ───────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
     background: #0f1117 !important;
     border-right: 1px solid #2d3148;
 }
-[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
 
-/* Main area */
+/* Sidebar widget labels — soft grey so they're readable but not harsh */
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stTextInput label,
+[data-testid="stSidebar"] .stTextArea label,
+[data-testid="stSidebar"] .stSlider label,
+[data-testid="stSidebar"] .stNumberInput label,
+[data-testid="stSidebar"] .stFileUploader label {
+    color: #94a3b8 !important;   /* muted slate — readable on dark bg */
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.04em !important;
+}
+
+/* Sidebar heading text (##) */
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 {
+    color: #cbd5e1 !important;
+}
+
+/* Sidebar input boxes */
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea {
+    background: #1a1d27 !important;
+    color: #f1f5f9 !important;
+    border: 1px solid #2d3148 !important;
+    border-radius: 6px !important;
+}
+
+/* Slider track + thumb */
+[data-testid="stSidebar"] [data-testid="stSlider"] div[role="slider"] {
+    background: #4f8ef7 !important;
+}
+
+/* Info box inside sidebar */
+[data-testid="stSidebar"] .stAlert {
+    background: #1a2035 !important;
+    border: 1px solid #2d3148 !important;
+    color: #94a3b8 !important;
+    font-size: 0.72rem !important;
+}
+
+/* ── Main area ──────────────────────────────────────────────────── */
 .main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 
 /* Metric cards */
@@ -466,8 +537,9 @@ html, body, [class*="css"] { font-family: 'Sora', sans-serif; }
     padding: 12px 16px;
 }
 
-/* Buttons */
-.stButton > button {
+/* ── Buttons ────────────────────────────────────────────────────── */
+/* RUN  — blue */
+div[data-testid="column"]:nth-child(1) .stButton > button {
     background: #4f8ef7 !important;
     color: white !important;
     border: none !important;
@@ -477,14 +549,45 @@ html, body, [class*="css"] { font-family: 'Sora', sans-serif; }
     padding: 0.5rem 1.4rem !important;
     transition: opacity 0.2s;
 }
-.stButton > button:hover { opacity: 0.85; }
+div[data-testid="column"]:nth-child(1) .stButton > button:hover { opacity: 0.85; }
 
-/* Stop button override via key targeting trick */
+/* PAUSE — amber */
 div[data-testid="column"]:nth-child(2) .stButton > button {
-    background: #ef4444 !important;
+    background: #d97706 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important;
+    transition: opacity 0.2s;
 }
 
-/* Log area */
+/* STOP — red */
+div[data-testid="column"]:nth-child(3) .stButton > button {
+    background: #ef4444 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important;
+    transition: opacity 0.2s;
+}
+
+/* SAVE partial — teal */
+div[data-testid="column"]:nth-child(4) .stButton > button {
+    background: #0d9488 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important;
+    transition: opacity 0.2s;
+}
+
+/* ── Log area ───────────────────────────────────────────────────── */
 .log-box {
     background: #1a1d27;
     border: 1px solid #2d3148;
@@ -504,7 +607,7 @@ div[data-testid="column"]:nth-child(2) .stButton > button {
 .log-info { color: #4f8ef7; }
 .log-dim  { color: #64748b; }
 
-/* Title bar */
+/* ── Title bar ──────────────────────────────────────────────────── */
 .title-bar {
     background: #1a1d27;
     border: 1px solid #2d3148;
@@ -528,7 +631,7 @@ div[data-testid="column"]:nth-child(2) .stButton > button {
     color: #22c55e;
 }
 
-/* Section headers */
+/* ── Section headers ────────────────────────────────────────────── */
 .section-head {
     font-family: 'Sora', sans-serif;
     font-size: 0.78rem;
@@ -546,8 +649,8 @@ div[data-testid="column"]:nth-child(2) .stButton > button {
 # ── Title bar ─────────────────────────────────────────────────────────
 st.markdown("""
 <div class="title-bar">
-  <h1>⬡ KEYWORD & PART SCANNER — ULTRA-LITE v5</h1>
-  <span>HEAD probe · Stream · Early-Exit · ~95% less network vs v3</span>
+  <h1>⬡ KEYWORD &amp; PART SCANNER — ULTRA-LITE v5</h1>
+  <span>HEAD probe · Stream · Early-Exit · Stop/Pause/Save · Auto-save on error</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -563,14 +666,14 @@ with st.sidebar:
     ref_file   = st.file_uploader("Reference Sheet (.xlsx)", type=["xlsx"], key="ref")
 
     st.markdown('<div class="section-head">🗂 Column Names</div>', unsafe_allow_html=True)
-    url_col  = st.text_input("URL column name",  value="offlineURL")
+    url_col  = st.text_input("URL column name",    value="offlineURL")
     part_col = st.text_input("Part Number column", value="PartNumber")
 
     if links_file:
         try:
             preview_df = pd.read_excel(io.BytesIO(links_file.read()), nrows=0)
             links_file.seek(0)
-            st.info("📋 Columns found:\n" + "  |  ".join(preview_df.columns.tolist()))
+            st.info("📋 Columns: " + "  |  ".join(preview_df.columns.tolist()))
         except Exception:
             pass
 
@@ -595,68 +698,32 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  MAIN PANEL
-# ══════════════════════════════════════════════════════════════════════
-
-# ── Stats row ─────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">📈 Live Stats</div>', unsafe_allow_html=True)
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-stat_total   = col1.metric("Total Rows",  "—")
-stat_jobs    = col2.metric("Jobs",        "—")
-stat_done    = col3.metric("Completed",   "0")
-stat_failed  = col4.metric("Failed",      "0")
-stat_chunk   = col5.metric("Chunk",       "—")
-stat_circuit = col6.metric("CB Errors",   "0")
-
-total_ph   = col1.empty()
-jobs_ph    = col2.empty()
-done_ph    = col3.empty()
-failed_ph  = col4.empty()
-chunk_ph   = col5.empty()
-circuit_ph = col6.empty()
-
-# ── Progress ──────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">📊 Progress</div>', unsafe_allow_html=True)
-prog_bar  = st.progress(0)
-prog_text = st.empty()
-status_ph = st.empty()
-
-# ── Buttons ───────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">🚀 Actions</div>', unsafe_allow_html=True)
-btn_col1, btn_col2 = st.columns([1, 5])
-with btn_col1:
-    run_btn = st.button("▶  RUN SCAN", use_container_width=True)
-
-# ── Log ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">🖥 Log</div>', unsafe_allow_html=True)
-log_ph = st.empty()
-
-# ── Results ───────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">✅ Results</div>', unsafe_allow_html=True)
-results_ph = st.empty()
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════════════════
 
-if "log_lines" not in st.session_state:
-    st.session_state.log_lines = []
-if "scan_done" not in st.session_state:
-    st.session_state.scan_done = False
-if "result_bytes" not in st.session_state:
-    st.session_state.result_bytes = None
-if "failed_bytes" not in st.session_state:
-    st.session_state.failed_bytes = None
+for _key, _default in [
+    ("log_lines",     []),
+    ("scan_done",     False),
+    ("scan_running",  False),
+    ("scan_paused",   False),
+    ("result_bytes",  None),
+    ("failed_bytes",  None),
+    ("partial_bytes", None),
+    ("stop_event",    None),
+    ("pause_event",   None),
+    # Carry scan context so Stop/Save can rebuild the file mid-run
+    ("_scan_ctx",     None),
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
 
 
 def _append_log(msg: str, tag: str = ""):
     css = {"ok": "log-ok", "err": "log-err", "warn": "log-warn",
            "info": "log-info", "dim": "log-dim"}.get(tag, "")
-    ts = time.strftime("%H:%M:%S")
+    ts   = time.strftime("%H:%M:%S")
     line = f'<span class="{css}">[{ts}] {msg}</span>'
     st.session_state.log_lines.append(line)
-    # keep last 300 lines
     if len(st.session_state.log_lines) > 300:
         st.session_state.log_lines = st.session_state.log_lines[-300:]
 
@@ -666,24 +733,141 @@ def _render_log():
     log_ph.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  MAIN PANEL LAYOUT
+# ══════════════════════════════════════════════════════════════════════
+
+st.markdown('<div class="section-head">📈 Live Stats</div>', unsafe_allow_html=True)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+total_ph   = col1.empty()
+jobs_ph    = col2.empty()
+done_ph    = col3.empty()
+failed_ph  = col4.empty()
+chunk_ph   = col5.empty()
+circuit_ph = col6.empty()
+total_ph.metric("Total Rows", "—")
+jobs_ph.metric("Jobs",        "—")
+done_ph.metric("Completed",   "0")
+failed_ph.metric("Failed",    "0")
+chunk_ph.metric("Chunk",      "—")
+circuit_ph.metric("CB Errors","0")
+
+st.markdown('<div class="section-head">📊 Progress</div>', unsafe_allow_html=True)
+prog_bar  = st.progress(0)
+prog_text = st.empty()
+status_ph = st.empty()
+
+# ── Action buttons ────────────────────────────────────────────────────
+st.markdown('<div class="section-head">🚀 Actions</div>', unsafe_allow_html=True)
+btn_c1, btn_c2, btn_c3, btn_c4, _rest = st.columns([1, 1, 1, 1, 3])
+with btn_c1:
+    run_btn   = st.button("▶ RUN SCAN",  use_container_width=True,
+                          disabled=st.session_state.scan_running)
+with btn_c2:
+    pause_lbl = "⏸ PAUSE" if not st.session_state.scan_paused else "▶ RESUME"
+    pause_btn = st.button(pause_lbl, use_container_width=True,
+                          disabled=not st.session_state.scan_running)
+with btn_c3:
+    stop_btn  = st.button("⏹ STOP",     use_container_width=True,
+                          disabled=not st.session_state.scan_running)
+with btn_c4:
+    save_btn  = st.button("💾 SAVE NOW", use_container_width=True,
+                          disabled=not st.session_state.scan_running)
+
+st.markdown('<div class="section-head">🖥 Log</div>', unsafe_allow_html=True)
+log_ph = st.empty()
+
+# ── FIX #1: Results section uses a plain container, not st.empty() ──
+# We use st.container() so we can render multiple widgets inside it.
+st.markdown('<div class="section-head">✅ Results</div>', unsafe_allow_html=True)
+results_container = st.container()
+
 # Re-render log on every rerun
 _render_log()
 
-# Show previous download buttons if scan already done
-if st.session_state.scan_done and st.session_state.result_bytes:
-    results_ph.download_button(
-        label="📥 Download Results (.xlsx)",
-        data=st.session_state.result_bytes,
-        file_name="scan_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+# ── Show download buttons from previous completed scan ────────────────
+with results_container:
+    if st.session_state.scan_done and st.session_state.result_bytes:
+        dl1, dl2 = st.columns([1, 1])
+        dl1.download_button(
+            label="📥 Download Results (.xlsx)",
+            data=st.session_state.result_bytes,
+            file_name="scan_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_results_top",
+        )
+        if st.session_state.failed_bytes:
+            dl2.download_button(
+                label="⚠️ Download Failed Rows (.xlsx)",
+                data=st.session_state.failed_bytes,
+                file_name="scan_failed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_failed_top",
+            )
+
+    if st.session_state.partial_bytes and not st.session_state.scan_done:
+        st.download_button(
+            label="💾 Download Partial Results (.xlsx)",
+            data=st.session_state.partial_bytes,
+            file_name="scan_partial.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_partial",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PAUSE / STOP / SAVE HANDLERS  (before run_btn so they fire first)
+# ══════════════════════════════════════════════════════════════════════
+
+if pause_btn and st.session_state.scan_running:
+    if st.session_state.pause_event is not None:
+        if st.session_state.scan_paused:
+            st.session_state.pause_event.clear()   # resume
+            st.session_state.scan_paused = False
+            _append_log("▶ Resumed by user.", "ok")
+        else:
+            st.session_state.pause_event.set()     # pause
+            st.session_state.scan_paused = True
+            _append_log("⏸ Paused by user — workers will finish current request then wait.", "warn")
+    st.rerun()
+
+if stop_btn and st.session_state.scan_running:
+    if st.session_state.stop_event is not None:
+        st.session_state.stop_event.set()
+    # Also unpause so threads can see the stop
+    if st.session_state.pause_event is not None:
+        st.session_state.pause_event.clear()
+    _append_log("⏹ Stop requested — saving partial results …", "warn")
+    # Trigger a partial save immediately from current context
+    ctx = st.session_state._scan_ctx
+    if ctx:
+        pb = _build_partial_excel(
+            ctx["df_work"], ctx["all_results"], ctx["keywords"],
+            ctx["orig_qual"], ctx["orig_ztemp"], ctx["orig_feature"], ctx["ref_map"]
+        )
+        if pb:
+            st.session_state.partial_bytes = pb
+            _append_log(f"💾 Partial file saved ({len(ctx['all_results'])} rows).", "ok")
+    st.rerun()
+
+if save_btn and st.session_state.scan_running:
+    ctx = st.session_state._scan_ctx
+    if ctx:
+        pb = _build_partial_excel(
+            ctx["df_work"], ctx["all_results"], ctx["keywords"],
+            ctx["orig_qual"], ctx["orig_ztemp"], ctx["orig_feature"], ctx["ref_map"]
+        )
+        if pb:
+            st.session_state.partial_bytes = pb
+            _append_log(f"💾 Manual save: {len(ctx['all_results'])} rows saved.", "ok")
+    st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  RUN SCAN
 # ══════════════════════════════════════════════════════════════════════
 
 if run_btn:
-    # Validate inputs
     if not links_file:
         st.error("❌ Please upload a Links Sheet (.xlsx) first.")
         st.stop()
@@ -696,10 +880,19 @@ if run_btn:
         st.stop()
 
     # Reset state
-    st.session_state.log_lines   = []
-    st.session_state.scan_done   = False
+    st.session_state.log_lines    = []
+    st.session_state.scan_done    = False
+    st.session_state.scan_running = True
+    st.session_state.scan_paused  = False
     st.session_state.result_bytes = None
     st.session_state.failed_bytes = None
+    st.session_state.partial_bytes = None
+
+    # Fresh stop / pause events
+    stop_event  = threading.Event()
+    pause_event = threading.Event()
+    st.session_state.stop_event  = stop_event
+    st.session_state.pause_event = pause_event
 
     def log(msg, tag=""):
         _append_log(msg, tag)
@@ -712,11 +905,12 @@ if run_btn:
     log(f"🎭 User-Agent pool: {len(_USER_AGENTS)} agents", "info")
     _render_log()
 
-    # Load data
+    # ── Load data ─────────────────────────────────────────────────────
     try:
         df = pd.read_excel(io.BytesIO(links_file.read()), dtype={part_col: str})
     except Exception as e:
         st.error(f"Cannot open links file: {e}")
+        st.session_state.scan_running = False
         st.stop()
 
     df_work = df.copy()
@@ -727,10 +921,10 @@ if run_btn:
     if url_col_lower not in df_work.columns:
         available = ", ".join(df.columns.tolist())
         st.error(
-            f"❌ Column **{url_col}** not found in sheet.\n\n"
-            f"Available columns: `{available}`\n\n"
-            "Fix the URL column name in the sidebar."
+            f"❌ Column **{url_col}** not found.\n\n"
+            f"Available: `{available}`\n\nFix the URL column name in the sidebar."
         )
+        st.session_state.scan_running = False
         st.stop()
 
     if part_col_lower not in df_work.columns:
@@ -749,7 +943,7 @@ if run_btn:
         ref_map = _build_ref_map(ref_file.read())
         log(f"Reference entries: {len(ref_map)}", "dim")
 
-    # Build jobs list
+    # ── Build jobs list ───────────────────────────────────────────────
     all_jobs = []
     for idx, row in df_work.iterrows():
         url  = row[url_col_lower]
@@ -763,13 +957,13 @@ if run_btn:
     total_ph.metric("Total Rows", total_rows)
     jobs_ph.metric("Jobs",        total_jobs)
     log(f"Rows: {total_rows}  |  Jobs: {total_jobs}", "info")
-    _render_log()
 
     chunks       = [all_jobs[i:i + chunk_size] for i in range(0, total_jobs, chunk_size)]
     total_chunks = len(chunks)
     log(f"Chunks: {total_chunks}  |  Chunk size: {chunk_size}", "info")
+    _render_log()
 
-    # Set up shared objects
+    # ── Shared objects ────────────────────────────────────────────────
     rate_limiter    = RateLimiter(max_per_minute=rpm)
     circuit_breaker = CircuitBreaker(error_threshold=cb_errors, pause_seconds=cb_pause)
     session         = requests.Session()
@@ -778,10 +972,26 @@ if run_btn:
     failed      = []
     done_cnt    = 0
 
+    # Store context so Pause/Stop/Save buttons can access it
+    st.session_state._scan_ctx = {
+        "df_work":     df_work,
+        "all_results": all_results,   # shared list — mutated in-place below
+        "keywords":    keywords,
+        "orig_qual":   orig_qual,
+        "orig_ztemp":  orig_ztemp,
+        "orig_feature":orig_feature,
+        "ref_map":     ref_map,
+    }
+
     status_ph.info("● RUNNING")
+    user_stopped = False
 
     try:
         for chunk_idx, chunk_jobs in enumerate(chunks):
+            if stop_event.is_set():
+                user_stopped = True
+                break
+
             chunk_ph.metric("Chunk", f"{chunk_idx+1}/{total_chunks}")
             log(f"── Chunk {chunk_idx+1}/{total_chunks} ({len(chunk_jobs)} jobs) ──", "info")
 
@@ -791,7 +1001,8 @@ if run_btn:
                         _process_row,
                         ri, url, part,
                         keywords, mil_keywords, timeout,
-                        rate_limiter, circuit_breaker, session
+                        rate_limiter, circuit_breaker, session,
+                        stop_event, pause_event
                     ): (ri, url, part)
                     for ri, url, part in chunk_jobs
                 }
@@ -805,6 +1016,19 @@ if run_btn:
                         tag   = "ok" if r.get("Part_Scanned") == "TRUE" else "dim"
                         short = url[:60] + "…" if len(url) > 60 else url
                         log(f"✓ [{ri}] {short} | Part={r.get('Part_Scanned')}", tag)
+                    except InterruptedError:
+                        # Worker was stopped — record as failed so row gets a default
+                        failed.append({"row_index": ri, "url": url, "part": part,
+                                       "error": "Stopped by user"})
+                        done_cnt += 1
+                        all_results.append({
+                            "_row_index":   ri,
+                            "_scan_url":    url,
+                            "_scan_part":   part,
+                            **{k: 0 for k in keywords},
+                            "Military":     0,
+                            "Part_Scanned": "FALSE",
+                        })
                     except Exception as e:
                         failed.append({"row_index": ri, "url": url, "part": part, "error": str(e)})
                         done_cnt += 1
@@ -815,34 +1039,61 @@ if run_btn:
                             "_scan_part":   part,
                             **{k: 0 for k in keywords},
                             "Military":     0,
-                            "Part_Scanned": "FALSE"
+                            "Part_Scanned": "FALSE",
                         })
+                        # ── FIX #4: auto-save partial on every error ──────
+                        pb = _build_partial_excel(
+                            df_work, all_results, keywords,
+                            orig_qual, orig_ztemp, orig_feature, ref_map
+                        )
+                        if pb:
+                            st.session_state.partial_bytes = pb
 
                     pct = int(done_cnt / total_jobs * 100) if total_jobs else 0
                     prog_bar.progress(pct)
                     prog_text.text(f"{done_cnt} / {total_jobs} jobs  ({pct}%)")
                     done_ph.metric("Completed", done_cnt)
-                    failed_ph.metric("Failed", len(failed))
+                    failed_ph.metric("Failed",    len(failed))
                     circuit_ph.metric("CB Errors", circuit_breaker.error_count)
 
+                    # Stop check inside future loop
+                    if stop_event.is_set():
+                        user_stopped = True
+                        break
+
             _render_log()
+
+            if stop_event.is_set():
+                user_stopped = True
+                break
 
             if chunk_idx < total_chunks - 1:
                 pause = random.uniform(delay_min * 2, delay_max * 2)
                 log(f"⏸ Pausing {pause:.1f}s between chunks …", "dim")
                 time.sleep(pause)
 
+    except Exception as outer_exc:
+        # ── FIX #4: unexpected outer error — auto-save whatever we have ──
+        log(f"💥 Unexpected error: {outer_exc}", "err")
+        pb = _build_partial_excel(
+            df_work, all_results, keywords,
+            orig_qual, orig_ztemp, orig_feature, ref_map
+        )
+        if pb:
+            st.session_state.partial_bytes = pb
+            log(f"💾 Auto-saved {len(all_results)} rows due to error.", "warn")
+
     finally:
         session.close()
+        st.session_state.scan_running = False
+        st.session_state.scan_paused  = False
+        st.session_state._scan_ctx    = None
 
-    log("Scan finished.", "dim")
-    _render_log()
-
+    # ── Build final output ────────────────────────────────────────────
     if not all_results:
         st.warning("No results to save.")
         st.stop()
 
-    # Build final dataframe
     df_final = _apply_results_to_df(
         df_work.copy(), all_results, keywords,
         orig_qual, orig_ztemp, orig_feature, ref_map
@@ -853,14 +1104,22 @@ if run_btn:
 
     result_bytes = _highlight_excel(df_final)
     st.session_state.result_bytes = result_bytes
-    st.session_state.scan_done    = True
+
+    if user_stopped:
+        st.session_state.partial_bytes = result_bytes   # treat as partial
+        log("⏹ Scan stopped by user — partial file ready.", "warn")
+        status_ph.warning("● STOPPED")
+    else:
+        st.session_state.scan_done = True
+        log("SCAN COMPLETE ✓", "ok")
+        status_ph.success("● COMPLETE")
 
     if failed:
         fail_df = pd.DataFrame(failed)
         buf = io.BytesIO()
         fail_df.to_excel(buf, index=False)
         st.session_state.failed_bytes = buf.getvalue()
-        log(f"Failed: {len(failed)} rows logged.", "warn")
+        log(f"Failed rows logged: {len(failed)}", "warn")
 
     # Summary
     true_part = (df_final.get("Part_Scanned",    pd.Series()) == "TRUE").sum()
@@ -870,26 +1129,26 @@ if run_btn:
     log(f"Part_Scanned T : {true_part}", "ok")
     log(f"Military TRUE  : {true_mil}", "ok")
     for kw in keywords:
-        col = f"{kw}_RESULT"
-        if col in df_final.columns:
-            log(f"{col}: TRUE={(df_final[col]=='TRUE').sum()}", "ok")
-    log("SCAN COMPLETE ✓", "ok")
+        col_name = f"{kw}_RESULT"
+        if col_name in df_final.columns:
+            log(f"{col_name}: TRUE={(df_final[col_name]=='TRUE').sum()}", "ok")
     _render_log()
 
-    status_ph.success("● COMPLETE")
-
-    # Download buttons
-    dl_col1, dl_col2 = results_ph.columns([1, 1])
-    dl_col1.download_button(
-        label="📥 Download Results (.xlsx)",
-        data=result_bytes,
-        file_name="scan_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    if st.session_state.failed_bytes:
-        dl_col2.download_button(
-            label="⚠️ Download Failed Rows (.xlsx)",
-            data=st.session_state.failed_bytes,
-            file_name="scan_failed.xlsx",
+    # ── FIX #1: Render download buttons inside the pre-declared container ──
+    with results_container:
+        dl1, dl2 = st.columns([1, 1])
+        dl1.download_button(
+            label="📥 Download Results (.xlsx)",
+            data=result_bytes,
+            file_name="scan_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_results_run",
         )
+        if st.session_state.failed_bytes:
+            dl2.download_button(
+                label="⚠️ Download Failed Rows (.xlsx)",
+                data=st.session_state.failed_bytes,
+                file_name="scan_failed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_failed_run",
+            )
