@@ -1,27 +1,24 @@
 """
-Keyword & Part Scanner — Ultra-Lite v5 (Streamlit Edition)
+Keyword & Part Scanner — Ultra-Lite v6 (Streamlit Edition)
 ===========================================================
-Fixes applied:
-  1. Results download button now renders correctly (was using .columns() on st.empty())
-  2. Sidebar text colours fixed — labels readable, values contrasted
-  3. Stop / Pause / Resume buttons added with threading Events
-  4. Auto-save on error / connection cut — partial results written to session_state immediately
+Fixes vs v5:
+  1. Page reset / data loss  → all mutable state lives in st.session_state;
+     scan runs in a background thread so Streamlit reruns never kill it.
+  2. Data lost on disconnect  → background thread writes results to
+     session_state every N rows (AUTOSAVE_EVERY) AND after each chunk.
+  3. Start needs two clicks   → scan_running flag set BEFORE st.rerun().
+  4. PDF no size limit        → MAX_PDF_BYTES raised to 50 MB; scan reads
+     all pages (no early-exit page cap) and falls back gracefully.
+  5. Other pre-existing bugs  → results container, sidebar label colours,
+     stop/pause/resume, auto-save on error — all preserved & improved.
 """
 
-import re
-import time
-import json
-import random
-import threading
-import io
-import os
-import collections
-import traceback
+import re, time, json, random, threading, io, os, collections, traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
-import fitz                     # PyMuPDF
+import fitz                       # PyMuPDF
 import urllib3
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
@@ -34,15 +31,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-MAX_HTML_BYTES = 300 * 1024
-MAX_PDF_BYTES  = 3 * 1024 * 1024
-HEAD_TIMEOUT   = 6
-MAX_RETRIES    = 3
-RETRY_BACKOFF  = [5, 15, 30]
-RETRY_ON_CODES = {429, 503, 502, 504}
+MAX_HTML_BYTES  = 300  * 1024          # 300 KB  — unchanged
+MAX_PDF_BYTES   = 50   * 1024 * 1024   # 50 MB   — was 3 MB (FIX #4)
+HEAD_TIMEOUT    = 8
+MAX_RETRIES     = 3
+RETRY_BACKOFF   = [5, 15, 30]
+RETRY_ON_CODES  = {429, 503, 502, 504}
+AUTOSAVE_EVERY  = 20   # write partial excel to session_state every N completed rows
 
-DEFAULT_KW     = "AEC-Q100\nAEC-Q200\nAEC-Q101"
-DEFAULT_MIL_KW = "Military\nMIL-PRF\nMIL-C\nMIL-R\nMIL-DTL"
+DEFAULT_KW      = "AEC-Q100\nAEC-Q200\nAEC-Q101"
+DEFAULT_MIL_KW  = "Military\nMIL-PRF\nMIL-C\nMIL-R\nMIL-DTL"
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -62,7 +60,6 @@ _BASE_HEADERS = {
 
 _ua_lock  = threading.Lock()
 _ua_index = 0
-
 
 def _get_headers() -> dict:
     global _ua_index
@@ -212,10 +209,16 @@ def _probe_content_type(url: str, session: requests.Session) -> str:
 
 
 def _read_pdf(url: str, kw_variants_list, part_lower, session: requests.Session) -> str:
+    """
+    FIX #4 — no page/byte hard-stop that silently skips the file.
+    We still cap at MAX_PDF_BYTES (50 MB) to avoid runaway downloads,
+    but we read ALL pages of whatever we downloaded.
+    If download fails after retries we return "" instead of crashing.
+    """
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            r = session.get(url, timeout=20, verify=False,
+            r = session.get(url, timeout=30, verify=False,
                             headers=_get_headers(), stream=True)
             if r.status_code in RETRY_ON_CODES:
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
@@ -226,24 +229,22 @@ def _read_pdf(url: str, kw_variants_list, part_lower, session: requests.Session)
             for chunk in r.iter_content(chunk_size=65536):
                 content += chunk
                 if len(content) >= MAX_PDF_BYTES:
-                    break
+                    break          # soft cap — still parse what we got
             r.close()
-            doc        = fitz.open(stream=content, filetype="pdf")
-            parts      = []
-            seen_lower = ""
-            for page in doc:
+
+            doc   = fitz.open(stream=content, filetype="pdf")
+            parts = []
+            for page in doc:           # read every page — no early exit
                 t = page.get_text()
                 if t.strip():
                     parts.append(t)
-                    seen_lower += t.lower()
-                    if _all_terms_found(seen_lower, kw_variants_list, part_lower):
-                        break
             doc.close()
             return " ".join(parts)
         except Exception as e:
             last_exc = e
             wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
             time.sleep(wait + random.uniform(1, 3))
+    # Return empty string so the row still gets written (not crashed)
     return ""
 
 
@@ -306,18 +307,15 @@ def _search_part(raw: str, part) -> str:
 def _process_row(row_index, url, part, keywords, mil_keywords, timeout,
                  rate_limiter, circuit_breaker, session,
                  stop_event=None, pause_event=None) -> dict:
-    """Scan one row. Respects stop/pause threading events."""
     url_str  = _safe_str(url)
     part_str = _safe_str(part)
 
-    # ── Pause support ──────────────────────────────────────────────
     if pause_event:
         while pause_event.is_set():
             if stop_event and stop_event.is_set():
                 raise InterruptedError("Stopped by user")
             time.sleep(0.5)
 
-    # ── Stop support ───────────────────────────────────────────────
     if stop_event and stop_event.is_set():
         raise InterruptedError("Stopped by user")
 
@@ -415,7 +413,6 @@ def _apply_results_to_df(df_work, results, keywords, orig_qual, orig_ztemp,
 
 
 def _highlight_excel(df: pd.DataFrame) -> bytes:
-    """Write df to an xlsx buffer and apply green/red/yellow fills."""
     buf = io.BytesIO()
     df.to_excel(buf, index=False)
     buf.seek(0)
@@ -451,7 +448,6 @@ def _highlight_excel(df: pd.DataFrame) -> bytes:
 
 def _build_partial_excel(df_work, all_results, keywords,
                           orig_qual, orig_ztemp, orig_feature, ref_map) -> bytes:
-    """Build an Excel file from whatever results we have so far (partial save)."""
     try:
         df_partial = _apply_results_to_df(
             df_work.copy(), all_results, keywords,
@@ -463,48 +459,247 @@ def _build_partial_excel(df_work, all_results, keywords,
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  BACKGROUND SCAN THREAD  (FIX #1 & #2)
+# ══════════════════════════════════════════════════════════════════════
+# The scan runs inside a daemon thread so Streamlit's own reruns
+# (triggered by button presses, polling, etc.) never kill it.
+# All output is written to st.session_state which IS thread-safe for
+# simple assignments.
+
+def _run_scan_thread(
+    df, df_work, url_col_lower, part_col_lower,
+    orig_qual, orig_ztemp, orig_feature,
+    keywords, mil_keywords,
+    ref_map, chunk_size, n_workers, timeout,
+    rpm, delay_min, delay_max, cb_errors, cb_pause,
+    stop_event, pause_event,
+):
+    ss = st.session_state   # shorthand
+
+    def log(msg, tag=""):
+        css = {"ok": "log-ok", "err": "log-err", "warn": "log-warn",
+               "info": "log-info", "dim": "log-dim"}.get(tag, "")
+        ts   = time.strftime("%H:%M:%S")
+        line = f'<span class="{css}">[{ts}] {msg}</span>'
+        ss.log_lines.append(line)
+        if len(ss.log_lines) > 500:
+            ss.log_lines = ss.log_lines[-500:]
+
+    def do_autosave(results, label=""):
+        pb = _build_partial_excel(
+            df_work.copy(), results, keywords,
+            orig_qual, orig_ztemp, orig_feature, ref_map
+        )
+        if pb:
+            ss.partial_bytes = pb
+            if label:
+                log(f"💾 Auto-saved {len(results)} rows {label}", "dim")
+
+    log(f"Rate limit : {rpm} req/min | Delay: {delay_min}–{delay_max}s", "info")
+    log(f"Circuit    : trip at {cb_errors} errors, pause {cb_pause}s", "info")
+    log(f"Workers    : {n_workers}  |  Timeout: {timeout}s", "info")
+    log(f"PDF cap    : {MAX_PDF_BYTES//1024//1024} MB (reads ALL pages)", "info")
+    log(f"HTML cap   : {MAX_HTML_BYTES//1024} KB", "info")
+    log(f"🎭 User-Agent pool: {len(_USER_AGENTS)} agents", "info")
+
+    # Build jobs
+    all_jobs = []
+    for idx, row in df_work.iterrows():
+        url  = row[url_col_lower]
+        part = row[part_col_lower]
+        if not url or url.lower() == "nan":
+            continue
+        all_jobs.append((idx, url, part))
+
+    total_rows = len(df_work)
+    total_jobs = len(all_jobs)
+    ss.stat_total_rows = total_rows
+    ss.stat_total_jobs = total_jobs
+    log(f"Rows: {total_rows}  |  Jobs: {total_jobs}", "info")
+
+    chunks       = [all_jobs[i:i + chunk_size] for i in range(0, total_jobs, chunk_size)]
+    total_chunks = len(chunks)
+    log(f"Chunks: {total_chunks}  |  Chunk size: {chunk_size}", "info")
+
+    rate_limiter    = RateLimiter(max_per_minute=rpm)
+    circuit_breaker = CircuitBreaker(error_threshold=cb_errors, pause_seconds=cb_pause)
+    session         = requests.Session()
+
+    all_results  = []
+    failed       = []
+    done_cnt     = 0
+    user_stopped = False
+
+    try:
+        for chunk_idx, chunk_jobs in enumerate(chunks):
+            if stop_event.is_set():
+                user_stopped = True
+                break
+
+            ss.stat_chunk = f"{chunk_idx+1}/{total_chunks}"
+            log(f"── Chunk {chunk_idx+1}/{total_chunks} ({len(chunk_jobs)} jobs) ──", "info")
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_row,
+                        ri, url, part,
+                        keywords, mil_keywords, timeout,
+                        rate_limiter, circuit_breaker, session,
+                        stop_event, pause_event
+                    ): (ri, url, part)
+                    for ri, url, part in chunk_jobs
+                }
+
+                for fut in as_completed(futures):
+                    ri, url, part = futures[fut]
+                    try:
+                        r = fut.result()
+                        all_results.append(r)
+                        done_cnt += 1
+                        tag   = "ok" if r.get("Part_Scanned") == "TRUE" else "dim"
+                        short = url[:60] + "…" if len(url) > 60 else url
+                        log(f"✓ [{ri}] {short} | Part={r.get('Part_Scanned')}", tag)
+                    except InterruptedError:
+                        failed.append({"row_index": ri, "url": url, "part": part,
+                                       "error": "Stopped by user"})
+                        done_cnt += 1
+                        all_results.append({
+                            "_row_index":   ri,
+                            "_scan_url":    url,
+                            "_scan_part":   part,
+                            **{k: 0 for k in keywords},
+                            "Military":     0,
+                            "Part_Scanned": "FALSE",
+                        })
+                    except Exception as e:
+                        failed.append({"row_index": ri, "url": url, "part": part, "error": str(e)})
+                        done_cnt += 1
+                        log(f"✗ [{ri}] {url[:60]} | {e}", "err")
+                        all_results.append({
+                            "_row_index":   ri,
+                            "_scan_url":    url,
+                            "_scan_part":   part,
+                            **{k: 0 for k in keywords},
+                            "Military":     0,
+                            "Part_Scanned": "FALSE",
+                        })
+
+                    # ── FIX #2: auto-save every N rows ──────────────────
+                    if done_cnt % AUTOSAVE_EVERY == 0:
+                        do_autosave(all_results, f"({done_cnt}/{total_jobs})")
+
+                    # Update live stats
+                    ss.stat_done    = done_cnt
+                    ss.stat_failed  = len(failed)
+                    ss.stat_cb      = circuit_breaker.error_count
+                    ss.stat_pct     = int(done_cnt / total_jobs * 100) if total_jobs else 0
+
+                    if stop_event.is_set():
+                        user_stopped = True
+                        break
+
+            # Save after each chunk
+            do_autosave(all_results, f"after chunk {chunk_idx+1}")
+
+            if stop_event.is_set():
+                user_stopped = True
+                break
+
+            if chunk_idx < total_chunks - 1:
+                pause = random.uniform(delay_min * 2, delay_max * 2)
+                log(f"⏸ Pausing {pause:.1f}s between chunks …", "dim")
+                time.sleep(pause)
+
+    except Exception as outer_exc:
+        log(f"💥 Unexpected error: {outer_exc}", "err")
+        do_autosave(all_results, "(error recovery)")
+
+    finally:
+        session.close()
+
+    # ── Build final output ─────────────────────────────────────────────
+    if not all_results:
+        ss.scan_status  = "no_results"
+        ss.scan_running = False
+        return
+
+    df_final = _apply_results_to_df(
+        df_work.copy(), all_results, keywords,
+        orig_qual, orig_ztemp, orig_feature, ref_map
+    )
+    orig_cols = {c.strip().lower(): c.strip() for c in df.columns}
+    df_final.rename(columns=orig_cols, inplace=True)
+
+    result_bytes = _highlight_excel(df_final)
+    ss.result_bytes = result_bytes
+    ss.stat_done    = done_cnt
+    ss.stat_pct     = 100
+
+    if user_stopped:
+        ss.partial_bytes = result_bytes
+        log("⏹ Scan stopped — partial file ready.", "warn")
+        ss.scan_status = "stopped"
+    else:
+        ss.scan_done   = True
+        ss.scan_status = "complete"
+        log("SCAN COMPLETE ✓", "ok")
+
+    if failed:
+        fail_df = pd.DataFrame(failed)
+        buf = io.BytesIO()
+        fail_df.to_excel(buf, index=False)
+        ss.failed_bytes = buf.getvalue()
+        log(f"Failed rows logged: {len(failed)}", "warn")
+
+    # Summary
+    true_part = (df_final.get("Part_Scanned",    pd.Series()) == "TRUE").sum()
+    true_mil  = (df_final.get("Military_RESULT", pd.Series()) == "TRUE").sum()
+    log("═" * 50, "dim")
+    log(f"Total rows     : {len(df_final)}", "ok")
+    log(f"Part_Scanned T : {true_part}",     "ok")
+    log(f"Military TRUE  : {true_mil}",       "ok")
+    for kw in keywords:
+        col_name = f"{kw}_RESULT"
+        if col_name in df_final.columns:
+            log(f"{col_name}: TRUE={(df_final[col_name]=='TRUE').sum()}", "ok")
+
+    ss.scan_running = False
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  STREAMLIT PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Keyword & Part Scanner v5",
+    page_title="Keyword & Part Scanner v6",
     page_icon="⬡",
     layout="wide",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Sora:wght@400;600;700&display=swap');
 
 html, body, [class*="css"] { font-family: 'Sora', sans-serif; }
 
-/* ── Sidebar base ───────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
     background: #0f1117 !important;
     border-right: 1px solid #2d3148;
 }
-
-/* Sidebar widget labels — soft grey so they're readable but not harsh */
 [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] .stTextInput label,
 [data-testid="stSidebar"] .stTextArea label,
 [data-testid="stSidebar"] .stSlider label,
 [data-testid="stSidebar"] .stNumberInput label,
 [data-testid="stSidebar"] .stFileUploader label {
-    color: #94a3b8 !important;   /* muted slate — readable on dark bg */
+    color: #94a3b8 !important;
     font-size: 0.78rem !important;
     font-weight: 600 !important;
     letter-spacing: 0.04em !important;
 }
-
-/* Sidebar heading text (##) */
 [data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3 {
-    color: #cbd5e1 !important;
-}
-
-/* Sidebar input boxes */
+[data-testid="stSidebar"] h3 { color: #cbd5e1 !important; }
 [data-testid="stSidebar"] input,
 [data-testid="stSidebar"] textarea {
     background: #1a1d27 !important;
@@ -512,150 +707,82 @@ html, body, [class*="css"] { font-family: 'Sora', sans-serif; }
     border: 1px solid #2d3148 !important;
     border-radius: 6px !important;
 }
-
-/* Slider track + thumb */
-[data-testid="stSidebar"] [data-testid="stSlider"] div[role="slider"] {
-    background: #4f8ef7 !important;
-}
-
-/* Info box inside sidebar */
 [data-testid="stSidebar"] .stAlert {
     background: #1a2035 !important;
     border: 1px solid #2d3148 !important;
     color: #94a3b8 !important;
     font-size: 0.72rem !important;
 }
-
-/* ── Main area ──────────────────────────────────────────────────── */
 .main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-
-/* Metric cards */
 [data-testid="metric-container"] {
     background: #1a1d27;
     border: 1px solid #2d3148;
     border-radius: 10px;
     padding: 12px 16px;
 }
-
-/* ── Buttons ────────────────────────────────────────────────────── */
-/* RUN  — blue */
 div[data-testid="column"]:nth-child(1) .stButton > button {
-    background: #4f8ef7 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-weight: 600 !important;
-    padding: 0.5rem 1.4rem !important;
-    transition: opacity 0.2s;
+    background: #4f8ef7 !important; color: white !important;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important; transition: opacity 0.2s;
 }
 div[data-testid="column"]:nth-child(1) .stButton > button:hover { opacity: 0.85; }
-
-/* PAUSE — amber */
 div[data-testid="column"]:nth-child(2) .stButton > button {
-    background: #d97706 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-weight: 600 !important;
-    padding: 0.5rem 1.4rem !important;
-    transition: opacity 0.2s;
+    background: #d97706 !important; color: white !important;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important; transition: opacity 0.2s;
 }
-
-/* STOP — red */
 div[data-testid="column"]:nth-child(3) .stButton > button {
-    background: #ef4444 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-weight: 600 !important;
-    padding: 0.5rem 1.4rem !important;
-    transition: opacity 0.2s;
+    background: #ef4444 !important; color: white !important;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important; transition: opacity 0.2s;
 }
-
-/* SAVE partial — teal */
 div[data-testid="column"]:nth-child(4) .stButton > button {
-    background: #0d9488 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'Sora', sans-serif !important;
-    font-weight: 600 !important;
-    padding: 0.5rem 1.4rem !important;
-    transition: opacity 0.2s;
+    background: #0d9488 !important; color: white !important;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    padding: 0.5rem 1.4rem !important; transition: opacity 0.2s;
 }
-
-/* ── Log area ───────────────────────────────────────────────────── */
 .log-box {
-    background: #1a1d27;
-    border: 1px solid #2d3148;
-    border-radius: 8px;
-    padding: 12px 16px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    color: #e2e8f0;
-    height: 320px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
+    background: #1a1d27; border: 1px solid #2d3148; border-radius: 8px;
+    padding: 12px 16px; font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; color: #e2e8f0; height: 320px;
+    overflow-y: auto; white-space: pre-wrap; word-break: break-all;
 }
 .log-ok   { color: #22c55e; }
 .log-err  { color: #ef4444; }
 .log-warn { color: #f59e0b; }
 .log-info { color: #4f8ef7; }
 .log-dim  { color: #64748b; }
-
-/* ── Title bar ──────────────────────────────────────────────────── */
 .title-bar {
-    background: #1a1d27;
-    border: 1px solid #2d3148;
-    border-radius: 12px;
-    padding: 16px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 1.2rem;
+    background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px;
+    padding: 16px 24px; display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 1.2rem;
 }
 .title-bar h1 {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.15rem;
-    font-weight: 700;
-    color: #4f8ef7;
-    margin: 0;
+    font-family: 'JetBrains Mono', monospace; font-size: 1.15rem;
+    font-weight: 700; color: #4f8ef7; margin: 0;
 }
-.title-bar span {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
-    color: #22c55e;
-}
-
-/* ── Section headers ────────────────────────────────────────────── */
+.title-bar span { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: #22c55e; }
 .section-head {
-    font-family: 'Sora', sans-serif;
-    font-size: 0.78rem;
-    font-weight: 700;
-    color: #64748b;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    margin: 1.1rem 0 0.4rem 0;
-    border-bottom: 1px solid #2d3148;
-    padding-bottom: 4px;
+    font-family: 'Sora', sans-serif; font-size: 0.78rem; font-weight: 700;
+    color: #64748b; text-transform: uppercase; letter-spacing: 0.12em;
+    margin: 1.1rem 0 0.4rem 0; border-bottom: 1px solid #2d3148; padding-bottom: 4px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Title bar ─────────────────────────────────────────────────────────
 st.markdown("""
 <div class="title-bar">
-  <h1>⬡ KEYWORD &amp; PART SCANNER — ULTRA-LITE v5</h1>
-  <span>HEAD probe · Stream · Early-Exit · Stop/Pause/Save · Auto-save on error</span>
+  <h1>⬡ KEYWORD &amp; PART SCANNER — ULTRA-LITE v6</h1>
+  <span>Background thread · Persistent state · No-limit PDF · Stop/Pause/Save · Auto-save</span>
 </div>
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════
-#  SIDEBAR — SETTINGS
+#  SIDEBAR
 # ══════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
@@ -696,41 +823,40 @@ with st.sidebar:
     cb_errors  = st.slider("Circuit breaker error threshold",  1,  50,  5)
     cb_pause   = st.slider("Circuit breaker pause (s)",        5, 600, 60)
 
+    st.markdown('<div class="section-head">🔄 Auto-save</div>', unsafe_allow_html=True)
+    st.info(f"Partial results saved every {AUTOSAVE_EVERY} completed rows and after each chunk.")
+
 
 # ══════════════════════════════════════════════════════════════════════
-#  SESSION STATE
+#  SESSION STATE  (initialise once)
 # ══════════════════════════════════════════════════════════════════════
 
-for _key, _default in [
-    ("log_lines",     []),
-    ("scan_done",     False),
-    ("scan_running",  False),
-    ("scan_paused",   False),
-    ("result_bytes",  None),
-    ("failed_bytes",  None),
-    ("partial_bytes", None),
-    ("stop_event",    None),
-    ("pause_event",   None),
-    # Carry scan context so Stop/Save can rebuild the file mid-run
-    ("_scan_ctx",     None),
-]:
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
-
-
-def _append_log(msg: str, tag: str = ""):
-    css = {"ok": "log-ok", "err": "log-err", "warn": "log-warn",
-           "info": "log-info", "dim": "log-dim"}.get(tag, "")
-    ts   = time.strftime("%H:%M:%S")
-    line = f'<span class="{css}">[{ts}] {msg}</span>'
-    st.session_state.log_lines.append(line)
-    if len(st.session_state.log_lines) > 300:
-        st.session_state.log_lines = st.session_state.log_lines[-300:]
-
-
-def _render_log():
-    html = "\n".join(st.session_state.log_lines)
-    log_ph.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
+_DEFAULTS = dict(
+    log_lines     = [],
+    scan_done     = False,
+    scan_running  = False,
+    scan_paused   = False,
+    scan_status   = "",          # "complete" | "stopped" | "no_results" | ""
+    result_bytes  = None,
+    failed_bytes  = None,
+    partial_bytes = None,
+    stop_event    = None,
+    pause_event   = None,
+    # Live stats updated by background thread
+    stat_total_rows = 0,
+    stat_total_jobs = 0,
+    stat_done       = 0,
+    stat_failed     = 0,
+    stat_chunk      = "—",
+    stat_cb         = 0,
+    stat_pct        = 0,
+    # Uploaded file bytes cached so thread can access them after rerun
+    _links_bytes  = None,
+    _ref_bytes    = None,
+)
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -745,70 +871,89 @@ done_ph    = col3.empty()
 failed_ph  = col4.empty()
 chunk_ph   = col5.empty()
 circuit_ph = col6.empty()
-total_ph.metric("Total Rows", "—")
-jobs_ph.metric("Jobs",        "—")
-done_ph.metric("Completed",   "0")
-failed_ph.metric("Failed",    "0")
-chunk_ph.metric("Chunk",      "—")
-circuit_ph.metric("CB Errors","0")
+
+ss = st.session_state
+total_ph.metric("Total Rows", ss.stat_total_rows or "—")
+jobs_ph.metric("Jobs",        ss.stat_total_jobs or "—")
+done_ph.metric("Completed",   ss.stat_done)
+failed_ph.metric("Failed",    ss.stat_failed)
+chunk_ph.metric("Chunk",      ss.stat_chunk)
+circuit_ph.metric("CB Errors",ss.stat_cb)
 
 st.markdown('<div class="section-head">📊 Progress</div>', unsafe_allow_html=True)
-prog_bar  = st.progress(0)
+prog_bar  = st.progress(ss.stat_pct)
 prog_text = st.empty()
+prog_text.text(f"{ss.stat_done} / {ss.stat_total_jobs} jobs  ({ss.stat_pct}%)")
+
 status_ph = st.empty()
+if ss.scan_running:
+    status_ph.info("● RUNNING" + (" — PAUSED" if ss.scan_paused else ""))
+elif ss.scan_status == "complete":
+    status_ph.success("● COMPLETE")
+elif ss.scan_status == "stopped":
+    status_ph.warning("● STOPPED")
+elif ss.scan_status == "no_results":
+    status_ph.warning("● NO RESULTS")
 
 # ── Action buttons ────────────────────────────────────────────────────
 st.markdown('<div class="section-head">🚀 Actions</div>', unsafe_allow_html=True)
 btn_c1, btn_c2, btn_c3, btn_c4, _rest = st.columns([1, 1, 1, 1, 3])
 with btn_c1:
     run_btn   = st.button("▶ RUN SCAN",  use_container_width=True,
-                          disabled=st.session_state.scan_running)
+                          disabled=ss.scan_running)
 with btn_c2:
-    pause_lbl = "⏸ PAUSE" if not st.session_state.scan_paused else "▶ RESUME"
+    pause_lbl = "▶ RESUME" if ss.scan_paused else "⏸ PAUSE"
     pause_btn = st.button(pause_lbl, use_container_width=True,
-                          disabled=not st.session_state.scan_running)
+                          disabled=not ss.scan_running)
 with btn_c3:
     stop_btn  = st.button("⏹ STOP",     use_container_width=True,
-                          disabled=not st.session_state.scan_running)
+                          disabled=not ss.scan_running)
 with btn_c4:
     save_btn  = st.button("💾 SAVE NOW", use_container_width=True,
-                          disabled=not st.session_state.scan_running)
+                          disabled=not ss.scan_running)
+
+# ── Auto-refresh while running ────────────────────────────────────────
+# Use st.empty + time.sleep trick: ask Streamlit to rerun every 2 s
+if ss.scan_running:
+    st.markdown(
+        '<meta http-equiv="refresh" content="2">',
+        unsafe_allow_html=True,
+    )
 
 st.markdown('<div class="section-head">🖥 Log</div>', unsafe_allow_html=True)
 log_ph = st.empty()
 
-# ── FIX #1: Results section uses a plain container, not st.empty() ──
-# We use st.container() so we can render multiple widgets inside it.
 st.markdown('<div class="section-head">✅ Results</div>', unsafe_allow_html=True)
 results_container = st.container()
 
-# Re-render log on every rerun
-_render_log()
+# Render log
+html_log = "\n".join(ss.log_lines)
+log_ph.markdown(f'<div class="log-box">{html_log}</div>', unsafe_allow_html=True)
 
-# ── Show download buttons from previous completed scan ────────────────
+# Show download buttons
 with results_container:
-    if st.session_state.scan_done and st.session_state.result_bytes:
+    if ss.scan_done and ss.result_bytes:
         dl1, dl2 = st.columns([1, 1])
         dl1.download_button(
-            label="📥 Download Results (.xlsx)",
-            data=st.session_state.result_bytes,
+            "📥 Download Results (.xlsx)",
+            data=ss.result_bytes,
             file_name="scan_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_results_top",
         )
-        if st.session_state.failed_bytes:
+        if ss.failed_bytes:
             dl2.download_button(
-                label="⚠️ Download Failed Rows (.xlsx)",
-                data=st.session_state.failed_bytes,
+                "⚠️ Download Failed Rows (.xlsx)",
+                data=ss.failed_bytes,
                 file_name="scan_failed.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_failed_top",
             )
 
-    if st.session_state.partial_bytes and not st.session_state.scan_done:
+    if ss.partial_bytes and not ss.scan_done:
         st.download_button(
-            label="💾 Download Partial Results (.xlsx)",
-            data=st.session_state.partial_bytes,
+            "💾 Download Partial Results (.xlsx)",
+            data=ss.partial_bytes,
             file_name="scan_partial.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_partial",
@@ -816,55 +961,39 @@ with results_container:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PAUSE / STOP / SAVE HANDLERS  (before run_btn so they fire first)
+#  PAUSE / STOP / SAVE BUTTON HANDLERS
 # ══════════════════════════════════════════════════════════════════════
 
-if pause_btn and st.session_state.scan_running:
-    if st.session_state.pause_event is not None:
-        if st.session_state.scan_paused:
-            st.session_state.pause_event.clear()   # resume
-            st.session_state.scan_paused = False
-            _append_log("▶ Resumed by user.", "ok")
-        else:
-            st.session_state.pause_event.set()     # pause
-            st.session_state.scan_paused = True
-            _append_log("⏸ Paused by user — workers will finish current request then wait.", "warn")
+if pause_btn and ss.scan_running and ss.pause_event is not None:
+    if ss.scan_paused:
+        ss.pause_event.clear()
+        ss.scan_paused = False
+        ss.log_lines.append('<span class="log-ok">[--:--:--] ▶ Resumed by user.</span>')
+    else:
+        ss.pause_event.set()
+        ss.scan_paused = True
+        ss.log_lines.append('<span class="log-warn">[--:--:--] ⏸ Paused — workers will finish current request then wait.</span>')
     st.rerun()
 
-if stop_btn and st.session_state.scan_running:
-    if st.session_state.stop_event is not None:
-        st.session_state.stop_event.set()
-    # Also unpause so threads can see the stop
-    if st.session_state.pause_event is not None:
-        st.session_state.pause_event.clear()
-    _append_log("⏹ Stop requested — saving partial results …", "warn")
-    # Trigger a partial save immediately from current context
-    ctx = st.session_state._scan_ctx
-    if ctx:
-        pb = _build_partial_excel(
-            ctx["df_work"], ctx["all_results"], ctx["keywords"],
-            ctx["orig_qual"], ctx["orig_ztemp"], ctx["orig_feature"], ctx["ref_map"]
-        )
-        if pb:
-            st.session_state.partial_bytes = pb
-            _append_log(f"💾 Partial file saved ({len(ctx['all_results'])} rows).", "ok")
+if stop_btn and ss.scan_running and ss.stop_event is not None:
+    ss.stop_event.set()
+    if ss.pause_event is not None:
+        ss.pause_event.clear()   # un-pause so threads see stop
+    ss.log_lines.append('<span class="log-warn">[--:--:--] ⏹ Stop requested …</span>')
     st.rerun()
 
-if save_btn and st.session_state.scan_running:
-    ctx = st.session_state._scan_ctx
-    if ctx:
-        pb = _build_partial_excel(
-            ctx["df_work"], ctx["all_results"], ctx["keywords"],
-            ctx["orig_qual"], ctx["orig_ztemp"], ctx["orig_feature"], ctx["ref_map"]
+if save_btn and ss.scan_running:
+    # partial_bytes is already updated by the thread on every AUTOSAVE_EVERY rows
+    if ss.partial_bytes:
+        ss.log_lines.append(
+            f'<span class="log-ok">[--:--:--] 💾 Manual save triggered — '
+            f'{ss.stat_done} rows available.</span>'
         )
-        if pb:
-            st.session_state.partial_bytes = pb
-            _append_log(f"💾 Manual save: {len(ctx['all_results'])} rows saved.", "ok")
     st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  RUN SCAN
+#  RUN SCAN  — FIX #3: set scan_running=True BEFORE rerun
 # ══════════════════════════════════════════════════════════════════════
 
 if run_btn:
@@ -879,38 +1008,40 @@ if run_btn:
         st.error("❌ Enter at least one keyword.")
         st.stop()
 
-    # Reset state
-    st.session_state.log_lines    = []
-    st.session_state.scan_done    = False
-    st.session_state.scan_running = True
-    st.session_state.scan_paused  = False
-    st.session_state.result_bytes = None
-    st.session_state.failed_bytes = None
-    st.session_state.partial_bytes = None
+    # Cache file bytes in session_state so background thread can use them
+    ss._links_bytes = links_file.read()
+    ss._ref_bytes   = ref_file.read() if ref_file else None
 
-    # Fresh stop / pause events
+    # Reset state
+    ss.log_lines     = []
+    ss.scan_done     = False
+    ss.scan_paused   = False
+    ss.scan_status   = ""
+    ss.result_bytes  = None
+    ss.failed_bytes  = None
+    ss.partial_bytes = None
+    ss.stat_total_rows = 0
+    ss.stat_total_jobs = 0
+    ss.stat_done       = 0
+    ss.stat_failed     = 0
+    ss.stat_chunk      = "—"
+    ss.stat_cb         = 0
+    ss.stat_pct        = 0
+
     stop_event  = threading.Event()
     pause_event = threading.Event()
-    st.session_state.stop_event  = stop_event
-    st.session_state.pause_event = pause_event
+    ss.stop_event  = stop_event
+    ss.pause_event = pause_event
 
-    def log(msg, tag=""):
-        _append_log(msg, tag)
+    # ── FIX #3: mark running BEFORE we launch, BEFORE rerun ──────────
+    ss.scan_running = True
 
-    log(f"Rate limit : {rpm} req/min | Delay: {delay_min}–{delay_max}s", "info")
-    log(f"Circuit    : trip at {cb_errors} errors, pause {cb_pause}s", "info")
-    log(f"Workers    : {n_workers}  |  Timeout: {timeout}s", "info")
-    log("🚀 Mode: HEAD probe + streaming early-exit (no browser, no OCR)", "ok")
-    log(f"📦 HTML cap: {MAX_HTML_BYTES//1024} KB | PDF cap: {MAX_PDF_BYTES//1024//1024} MB", "info")
-    log(f"🎭 User-Agent pool: {len(_USER_AGENTS)} agents", "info")
-    _render_log()
-
-    # ── Load data ─────────────────────────────────────────────────────
+    # Load & validate dataframe synchronously (fast, no network)
     try:
-        df = pd.read_excel(io.BytesIO(links_file.read()), dtype={part_col: str})
+        df = pd.read_excel(io.BytesIO(ss._links_bytes), dtype={part_col: str})
     except Exception as e:
         st.error(f"Cannot open links file: {e}")
-        st.session_state.scan_running = False
+        ss.scan_running = False
         st.stop()
 
     df_work = df.copy()
@@ -924,11 +1055,14 @@ if run_btn:
             f"❌ Column **{url_col}** not found.\n\n"
             f"Available: `{available}`\n\nFix the URL column name in the sidebar."
         )
-        st.session_state.scan_running = False
+        ss.scan_running = False
         st.stop()
 
     if part_col_lower not in df_work.columns:
-        log(f"⚠ Column '{part_col}' not found — Part_Scanned will be FALSE for all.", "warn")
+        ss.log_lines.append(
+            f'<span class="log-warn">[--:--:--] ⚠ Column \'{part_col}\' not found — '
+            f'Part_Scanned will be FALSE for all.</span>'
+        )
         df_work[part_col_lower] = ""
 
     df_work[url_col_lower]  = df_work[url_col_lower].apply(_safe_str)
@@ -939,216 +1073,23 @@ if run_btn:
     orig_qual    = df_work.get("qualificationrangemapping", pd.Series("", index=df_work.index))
 
     ref_map = {}
-    if ref_file:
-        ref_map = _build_ref_map(ref_file.read())
-        log(f"Reference entries: {len(ref_map)}", "dim")
+    if ss._ref_bytes:
+        ref_map = _build_ref_map(ss._ref_bytes)
 
-    # ── Build jobs list ───────────────────────────────────────────────
-    all_jobs = []
-    for idx, row in df_work.iterrows():
-        url  = row[url_col_lower]
-        part = row[part_col_lower]
-        if not url or url.lower() == "nan":
-            continue
-        all_jobs.append((idx, url, part))
-
-    total_rows = len(df_work)
-    total_jobs = len(all_jobs)
-    total_ph.metric("Total Rows", total_rows)
-    jobs_ph.metric("Jobs",        total_jobs)
-    log(f"Rows: {total_rows}  |  Jobs: {total_jobs}", "info")
-
-    chunks       = [all_jobs[i:i + chunk_size] for i in range(0, total_jobs, chunk_size)]
-    total_chunks = len(chunks)
-    log(f"Chunks: {total_chunks}  |  Chunk size: {chunk_size}", "info")
-    _render_log()
-
-    # ── Shared objects ────────────────────────────────────────────────
-    rate_limiter    = RateLimiter(max_per_minute=rpm)
-    circuit_breaker = CircuitBreaker(error_threshold=cb_errors, pause_seconds=cb_pause)
-    session         = requests.Session()
-
-    all_results = []
-    failed      = []
-    done_cnt    = 0
-
-    # Store context so Pause/Stop/Save buttons can access it
-    st.session_state._scan_ctx = {
-        "df_work":     df_work,
-        "all_results": all_results,   # shared list — mutated in-place below
-        "keywords":    keywords,
-        "orig_qual":   orig_qual,
-        "orig_ztemp":  orig_ztemp,
-        "orig_feature":orig_feature,
-        "ref_map":     ref_map,
-    }
-
-    status_ph.info("● RUNNING")
-    user_stopped = False
-
-    try:
-        for chunk_idx, chunk_jobs in enumerate(chunks):
-            if stop_event.is_set():
-                user_stopped = True
-                break
-
-            chunk_ph.metric("Chunk", f"{chunk_idx+1}/{total_chunks}")
-            log(f"── Chunk {chunk_idx+1}/{total_chunks} ({len(chunk_jobs)} jobs) ──", "info")
-
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {
-                    pool.submit(
-                        _process_row,
-                        ri, url, part,
-                        keywords, mil_keywords, timeout,
-                        rate_limiter, circuit_breaker, session,
-                        stop_event, pause_event
-                    ): (ri, url, part)
-                    for ri, url, part in chunk_jobs
-                }
-
-                for fut in as_completed(futures):
-                    ri, url, part = futures[fut]
-                    try:
-                        r = fut.result()
-                        all_results.append(r)
-                        done_cnt += 1
-                        tag   = "ok" if r.get("Part_Scanned") == "TRUE" else "dim"
-                        short = url[:60] + "…" if len(url) > 60 else url
-                        log(f"✓ [{ri}] {short} | Part={r.get('Part_Scanned')}", tag)
-                    except InterruptedError:
-                        # Worker was stopped — record as failed so row gets a default
-                        failed.append({"row_index": ri, "url": url, "part": part,
-                                       "error": "Stopped by user"})
-                        done_cnt += 1
-                        all_results.append({
-                            "_row_index":   ri,
-                            "_scan_url":    url,
-                            "_scan_part":   part,
-                            **{k: 0 for k in keywords},
-                            "Military":     0,
-                            "Part_Scanned": "FALSE",
-                        })
-                    except Exception as e:
-                        failed.append({"row_index": ri, "url": url, "part": part, "error": str(e)})
-                        done_cnt += 1
-                        log(f"✗ [{ri}] {url[:60]} | {e}", "err")
-                        all_results.append({
-                            "_row_index":   ri,
-                            "_scan_url":    url,
-                            "_scan_part":   part,
-                            **{k: 0 for k in keywords},
-                            "Military":     0,
-                            "Part_Scanned": "FALSE",
-                        })
-                        # ── FIX #4: auto-save partial on every error ──────
-                        pb = _build_partial_excel(
-                            df_work, all_results, keywords,
-                            orig_qual, orig_ztemp, orig_feature, ref_map
-                        )
-                        if pb:
-                            st.session_state.partial_bytes = pb
-
-                    pct = int(done_cnt / total_jobs * 100) if total_jobs else 0
-                    prog_bar.progress(pct)
-                    prog_text.text(f"{done_cnt} / {total_jobs} jobs  ({pct}%)")
-                    done_ph.metric("Completed", done_cnt)
-                    failed_ph.metric("Failed",    len(failed))
-                    circuit_ph.metric("CB Errors", circuit_breaker.error_count)
-
-                    # Stop check inside future loop
-                    if stop_event.is_set():
-                        user_stopped = True
-                        break
-
-            _render_log()
-
-            if stop_event.is_set():
-                user_stopped = True
-                break
-
-            if chunk_idx < total_chunks - 1:
-                pause = random.uniform(delay_min * 2, delay_max * 2)
-                log(f"⏸ Pausing {pause:.1f}s between chunks …", "dim")
-                time.sleep(pause)
-
-    except Exception as outer_exc:
-        # ── FIX #4: unexpected outer error — auto-save whatever we have ──
-        log(f"💥 Unexpected error: {outer_exc}", "err")
-        pb = _build_partial_excel(
-            df_work, all_results, keywords,
-            orig_qual, orig_ztemp, orig_feature, ref_map
-        )
-        if pb:
-            st.session_state.partial_bytes = pb
-            log(f"💾 Auto-saved {len(all_results)} rows due to error.", "warn")
-
-    finally:
-        session.close()
-        st.session_state.scan_running = False
-        st.session_state.scan_paused  = False
-        st.session_state._scan_ctx    = None
-
-    # ── Build final output ────────────────────────────────────────────
-    if not all_results:
-        st.warning("No results to save.")
-        st.stop()
-
-    df_final = _apply_results_to_df(
-        df_work.copy(), all_results, keywords,
-        orig_qual, orig_ztemp, orig_feature, ref_map
+    # Launch background daemon thread
+    t = threading.Thread(
+        target=_run_scan_thread,
+        args=(
+            df, df_work, url_col_lower, part_col_lower,
+            orig_qual, orig_ztemp, orig_feature,
+            keywords, mil_keywords,
+            ref_map, int(chunk_size), n_workers, timeout,
+            rpm, delay_min, delay_max, cb_errors, cb_pause,
+            stop_event, pause_event,
+        ),
+        daemon=True,
     )
-    # Restore original column names
-    orig_cols = {c.strip().lower(): c.strip() for c in df.columns}
-    df_final.rename(columns=orig_cols, inplace=True)
+    t.start()
 
-    result_bytes = _highlight_excel(df_final)
-    st.session_state.result_bytes = result_bytes
-
-    if user_stopped:
-        st.session_state.partial_bytes = result_bytes   # treat as partial
-        log("⏹ Scan stopped by user — partial file ready.", "warn")
-        status_ph.warning("● STOPPED")
-    else:
-        st.session_state.scan_done = True
-        log("SCAN COMPLETE ✓", "ok")
-        status_ph.success("● COMPLETE")
-
-    if failed:
-        fail_df = pd.DataFrame(failed)
-        buf = io.BytesIO()
-        fail_df.to_excel(buf, index=False)
-        st.session_state.failed_bytes = buf.getvalue()
-        log(f"Failed rows logged: {len(failed)}", "warn")
-
-    # Summary
-    true_part = (df_final.get("Part_Scanned",    pd.Series()) == "TRUE").sum()
-    true_mil  = (df_final.get("Military_RESULT", pd.Series()) == "TRUE").sum()
-    log("═" * 50, "dim")
-    log(f"Total rows     : {len(df_final)}", "ok")
-    log(f"Part_Scanned T : {true_part}", "ok")
-    log(f"Military TRUE  : {true_mil}", "ok")
-    for kw in keywords:
-        col_name = f"{kw}_RESULT"
-        if col_name in df_final.columns:
-            log(f"{col_name}: TRUE={(df_final[col_name]=='TRUE').sum()}", "ok")
-    _render_log()
-
-    # ── FIX #1: Render download buttons inside the pre-declared container ──
-    with results_container:
-        dl1, dl2 = st.columns([1, 1])
-        dl1.download_button(
-            label="📥 Download Results (.xlsx)",
-            data=result_bytes,
-            file_name="scan_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_results_run",
-        )
-        if st.session_state.failed_bytes:
-            dl2.download_button(
-                label="⚠️ Download Failed Rows (.xlsx)",
-                data=st.session_state.failed_bytes,
-                file_name="scan_failed.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_failed_run",
-            )
+    # Rerun NOW so the UI immediately shows RUNNING state
+    st.rerun()
