@@ -792,17 +792,32 @@ with st.sidebar:
     links_file = st.file_uploader("Links Sheet (.xlsx)", type=["xlsx"], key="links")
     ref_file   = st.file_uploader("Reference Sheet (.xlsx)", type=["xlsx"], key="ref")
 
+    # ── Save bytes to session_state THE MOMENT a file is uploaded ──────
+    # This survives any future rerun so the bytes are never lost.
+    if links_file is not None:
+        st.session_state._links_bytes = links_file.read()
+        links_file.seek(0)
+    if ref_file is not None:
+        st.session_state._ref_bytes = ref_file.read()
+        ref_file.seek(0)
+
+    # Show a persistent indicator even after rerun clears the uploader widget
+    if st.session_state.get("_links_bytes"):
+        try:
+            _prev = pd.read_excel(io.BytesIO(st.session_state._links_bytes), nrows=0)
+            cols_str = "  |  ".join(_prev.columns.tolist())
+            st.success(f"✅ Links file loaded — Columns: {cols_str}")
+        except Exception:
+            st.success("✅ Links file loaded")
+    else:
+        st.warning("⚠️ No links file yet")
+
+    if st.session_state.get("_ref_bytes"):
+        st.success("✅ Reference file loaded")
+
     st.markdown('<div class="section-head">🗂 Column Names</div>', unsafe_allow_html=True)
     url_col  = st.text_input("URL column name",    value="offlineURL")
     part_col = st.text_input("Part Number column", value="PartNumber")
-
-    if links_file:
-        try:
-            preview_df = pd.read_excel(io.BytesIO(links_file.read()), nrows=0)
-            links_file.seek(0)
-            st.info("📋 Columns: " + "  |  ".join(preview_df.columns.tolist()))
-        except Exception:
-            pass
 
     st.markdown('<div class="section-head">🔑 Keywords</div>', unsafe_allow_html=True)
     kw_text  = st.text_area("Keywords (one per line)",          value=DEFAULT_KW,     height=100)
