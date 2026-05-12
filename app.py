@@ -23,6 +23,11 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -907,12 +912,19 @@ with btn_c4:
     save_btn  = st.button("💾 SAVE NOW", use_container_width=True,
                           disabled=not ss.scan_running)
 
-# Auto-refresh every 2 s while scan is running
+# Auto-refresh every 2 s while scan is running — NO meta refresh (causes full reload)
 if ss.scan_running:
-    st.markdown(
-        '<meta http-equiv="refresh" content="2">',
-        unsafe_allow_html=True,
-    )
+    if _HAS_AUTOREFRESH:
+        st_autorefresh(interval=2000, limit=None, key="scan_autorefresh")
+    else:
+        st.markdown(
+            """<script>
+            setTimeout(function(){
+                window.parent.postMessage({type:'streamlit:rerun'}, '*');
+            }, 2000);
+            </script>""",
+            unsafe_allow_html=True,
+        )
 
 st.markdown('<div class="section-head">🖥 Log</div>', unsafe_allow_html=True)
 log_ph = st.empty()
