@@ -68,30 +68,8 @@ DEFAULT_AUTO_KW = """\
 AEC-Q100
 AEC-Q101
 AEC-Q200
-AEC-Q003
-AEC-Q004
-AEC-Q005
-AEC-Q006
 Automotive Grade
 Automotive Qualified
-PPAP
-IATF 16949
-ISO/TS 16949
-AQP
-APQP
-FMEA
-Control Plan
-MSA
-SPC
-Cpk
-Grade 0
-Grade 1
-Grade 2
-Grade 3
-TS 16949
-Functional Safety
-ISO 26262
-ASIL"""
 
 DEFAULT_MIL_KW = """\
 Military
@@ -104,17 +82,7 @@ MIL-SPEC
 MIL-S
 MIL-M
 MIL-I
-QPL
-QML
-DSCC
-Defense
-Space Grade
-Hi-Rel
-High Reliability
-Screening
-Burn-in
-DLA
-ITAR"""
+"""
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
