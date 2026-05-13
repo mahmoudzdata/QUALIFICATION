@@ -70,7 +70,7 @@ AEC-Q101
 AEC-Q200
 Automotive Grade
 Automotive Qualified
-
+"""
 DEFAULT_MIL_KW = """\
 Military
 MIL-PRF
