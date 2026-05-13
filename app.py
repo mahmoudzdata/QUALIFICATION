@@ -705,7 +705,8 @@ if run_btn:
     for kw in auto_kws:
         if kw in df_final.columns:
             cnt = (df_final[kw]==1).sum()
-            if cnt: _log(f"  {kw}: {cnt} hits","ok")
+            if cnt > 0:
+              _log(f"  {kw}: {cnt} hits","ok")
     _log(f"Failed rows    : {len(failed)}","warn" if failed else "ok")
     _render_log()
 
